@@ -4,7 +4,8 @@ simOpts=struct('noiseVar', 1, 'noiseCorrCoeff', 0);
 data = rotating_energy_sources(500, simOpts);
 
 tic;
-Z = pasf(data, 2); toc
+Z = pasf(data, 2); 
+toc
 
 
 %%Now, plot the output.

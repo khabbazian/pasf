@@ -1,5 +1,4 @@
-function [Z_dynamics, Clusters, Eigenvectors, Eigenvalues, PhaseArray] ... 
-		= pasf(Z, nSpatialComponents, options)
+function [Components, Clusters, ClusterInfo, SDFInfo] = pasf(Z, nSpatialComponents, options, spatialMask)
 % PASF Phased-Aligned Spectral Filtering for Decomposing Spatiotemporal Dynamics.  
 % PASF seeks to extract dynamics from spatiotemporal signal via data
 % assimilation and modeling.  PASF assumes that the observed spatiotemporal
@@ -22,32 +21,61 @@ function [Z_dynamics, Clusters, Eigenvectors, Eigenvalues, PhaseArray] ...
 %		'nTopEVs' is the number of top eigenvectors PASF picks at each
 %			frequency from the estimated spectral density function. The
 %			default value is nSpatialComponents.
+%		'EigenThresholdMethod' is the method that is used to compute
+%			the hard threshold for dynamic eigenvalues to select dynamic
+%			eigenvectors corresponding to the signals. The default is ErrRate which 
+%			uses errorRate variable. The options are [ErrRate|MaxGap]
 %		'errorRate' is the maximum error rate. The function computes
 %			the eigenvalue threshold based on this rate. It should be
 %			determine based on SNR.
 %		'taperLen' is the taper length that is used for estimating the spectral
 %			density function. The default value is zero.
 %		'kmethod' is the type of smoothing kernel that is used to estimate
-%			the spectral density function. The default is 'triangle'.
+%			the spectral density function. The options are [box|gaussian|triangle].
+%			The default is 'triangle', a.k.a Daniell.
 %		'spans' is the bandwidth of the smoothing kernel that is used
 %			to estimate the spectral density function. The default value is
 %			floor(log(size(Z,3))).
 %		'detrend' is a variable that indicates if the trend of the signal
 %			should be removed for estimating the spectral density
 %			function. 0 does not detrend. 1 subtracts the mean. 2
-%			subtracts the linear trend. The default is 0.
-%		'boolSaveData' is a logical variable that indicates if the
-%			PASF's intermediate results should be saved on the hard-drive.
-%			It is useful for the large inputs. The default is 0.
+%			subtracts the linear trend. The default is 2.
+%		'kmeansReplicates' is number of kmeans replications. The default is 128.
+%		'outlierThreshold' is number between 0 and 2 that indicates
+%			what distnace from cluster centroid in kmeans should be treated
+%			as outliers and be removed from the cluster. The default is 2
+%			and that means accept all. Note that the similarity is
+%			1-correlation and all the distances are between 0 and 2.
+%		'saveData' is a variable that indicates if the
+%			PASF's intermediate and output results should be saved on the hard-drive.
+%			The default is 1.
+%		'boolUseSavedData" is a logical variable that indicates if
+%			saved intermediate results should be used. The looks for a file
+%			with name (bfilename)_intermediate_data.met.
 %		'bfilename' is the base file name that function uses to save data if
 %			indicated. The default is 'pasf_out'.
+%		'boolParfor' is a logical variable indicates that if the parfor
+%			should be used to accelerate the computations or not. The
+%			default is true.
 %		'boolQuietly' is a logical variable that indicates if the progress 
 %			method should not be reported. The default is 0. 
 % 		
-% OUTPUT 'Z_dynamics' is the input spatiotemporal signal that is decomposed
-% 	into nSpatialComponents+2 where the last two are noise and the input signal
-% 	after demeaning if specified. Z_dynamics is an array of size
-% 	d1 x d2 x T x (nSpatialComponents+2). 
+% OUTPUT 'Components' is the input spatiotemporal signal that is decomposed
+% 	into nSpatialComponents+2 components. The last two components are noise and
+% 	the input signal after demeaning if specified, respectively. Components is an
+% 	array of size d1 x d2 x T x (nSpatialComponents+2). 
+%
+% 	'Clusters' is an array of size nTopEVs x d3 where nTopEVs is the number
+% 	of selected eigenvectors and d3 is the number of time samples.
+% 	Clusters(k,f) shows the cluster label of the kth eigenvector of the
+% 	spectral density function at frequency f. If the cluster number is zero
+% 	that means the corresponding eigenvector didn't get clustered.
+%
+% 	'ClusterInfo' is a cell type object contains different information about
+% 	the clustering performance.
+%
+% 	'SDFInfo' is a cell type object contains eigenvectors, eigevalues, phases
+% 	of the spectral density function at all frequency. 
 %
 % Details	
 % 	For more details about the PASF refer to https://arxiv.org/abs/1604.04899
@@ -84,276 +112,515 @@ function [Z_dynamics, Clusters, Eigenvectors, Eigenvalues, PhaseArray] ...
 % 	axis(axesHandles,'square')
 % 	pause(0.02);
 % end % 
+%
+%% AUTHOR    : Mohammad Khabbazian
+%% $DATE     : 24-Apr-2017 $
+%% $Revision : 1.00 $
+%% DEVELOPED : R2016a
+%% FILENAME  : pasf.m
+%
 
- 
-if nargin == 1
-	nSpatialComponents = 1;
-end
-
-%% setting up the default values
-pasfOpts = struct('nTopEVs', nSpatialComponents, ...
-'errorRate', 0.01, ...
-'taperLen', 0, 'kmethod', 'triangle', 'spans', floor(log(size(Z,3))), ...
-'boolDemeanInput', 1, 'boolQuietly', 0, ...
-'detrend', 0, 'boolZeroPad', 0, 'boolSaveData', 0, 'bfilename', 'pasf_out');
-
-
-if nargin > 2
-	fields = fieldnames(options);
-	for f=1:length(fields),
-		pasfOpts.(fields{f}) = options.(fields{f});
+	if nargin == 1
+		nSpatialComponents = 1;
 	end
-end
+
+	%%TODO separate pasf options from mvspec options
+	%% setting up the default values
+	pasfOpts = struct('nTopEVs', nSpatialComponents, ...
+		'EigenThresholdMethod', 'ErrRate', ...
+		'Normalize', 0, ...
+		'SampleTimes', 1:size(Z, 3), ...
+		'errorRate', 0.01, ...
+		'cmethod', 'phase', ...
+		'taperLen', 0, 'kmethod', 'triangle', 'spans', floor(log(size(Z,3))), ...
+		'boolDemeanInput', 1, 'kmeansReplicates', 128, 'outlierThreshold', 2, ...
+		'detrend', 2, 'boolZeroPad', 0, 'saveData', 1, 'boolUseSavedData', 0, ...
+		'boolParfor', 1, ...
+		'boolQuietly', 0, 'bfilename', 'pasf_out');
 
 
-if pasfOpts.boolDemeanInput == 1,
-	Trend = mean(Z, [3]);
-	Z = Z - repmat(Trend, [1, 1, size(Z,3)]);
-end
-
-
-[d1, d2, d3] = size(Z);
-if(d3 > 1)
-	Z = permute(reshape(Z, d1*d2, d3), [2,1]); %NOTE: each column is a time series.
-end
-
-nTimes   = size(Z, 1);
-nSpatial = size(Z, 2);
-nTopEVs  = pasfOpts.nTopEVs;  
-
-if ~pasfOpts.boolQuietly,
-	disp(pasfOpts);
-	disp('done with the initial steps.');
-end
-
-
-[PVec_FT_Cxx, PPhase_FT_Cxx, Eigenvalues, NF, traceSums] = mvspec(Z, pasfOpts);
-
-if ~pasfOpts.boolQuietly,
-	disp('done with estimating the spectral density matrices and their eigen decomposition.');
-end
-
-
-if pasfOpts.boolSaveData,
-	filename = strcat(bfilename, '_intermediate_data.mat');
-	save(filename);
-end
-%load(filename);
-
-%%NOTE: uncomment the following to compile the c code.
-if exist('unwrap2D') ~= 3,
-	mex unwrap2D.c
-end
-
-%scoreMask = Eigenvalues > evThreshold;
-
-sortedEVs   = sort(Eigenvalues(:), 'descend');
-indicesMask = cumsum(sortedEVs)./traceSums > 1 - pasfOpts.errorRate;
-if(sum(indicesMask)>0)
-	eigenValueThreshold = max( sortedEVs(indicesMask) );
-else
-	eigenValueThreshold = 0;
-	warning('set the Delta(the eigenvalue threshold) to zero,... you may want to increase number of top eigenvalues.');
-end
-
-if ~pasfOpts.boolQuietly,
-	disp(strcat('eigenvalue threshold is: ', num2str(eigenValueThreshold), '.') );
-end
-
-scoreMask = Eigenvalues > eigenValueThreshold;
-
-PPhase_FT_Cxx = reshape(PPhase_FT_Cxx, nSpatial, nTopEVs * NF )';
-for i=1:size(PPhase_FT_Cxx, 1)
-	PPhase_FT_Cxx(i, :) = reshape( unwrap2D(reshape(PPhase_FT_Cxx(i, :), d1, d2), zeros(d1, d2)), 1, d1*d2);
-	%NOTE: subtracting the mean doesn't change the result but makes the plots prettier. 
-	PPhase_FT_Cxx(i, :) = PPhase_FT_Cxx(i, :) - mean(PPhase_FT_Cxx(i, :)); 	
-end
-
-%%NOTE: keep the unwrapped phase for ploting.
-PhaseArray = zeros(d1, d2, NF, nTopEVs);
-for j=1:NF, 
-	for k=1:nTopEVs,
-		PhaseArray(:, :, j, k) = reshape(PPhase_FT_Cxx( (j-1)*nTopEVs+k, :), d1, d2);
-	end
-end
-
-if ~pasfOpts.boolQuietly,
-	disp('done with the phase unwrapping.')
-end
-
-
-%Clusts = zeros(size(PPhase_FT_Cxx, 1), 1); 
-Clusts = zeros(size(scoreMask)); 
-
-%%NOTE: kmeans/linkage accepts the point cloud as a matrix whose rows are the data point (NOT columns).
-%kmeans with correlation as the similarity metric.
-half = (2+ceil((NF-1)/2));
-scoreMask(:, half:end) = 0;
-scoreMask = scoreMask(:);
-[memberships, centers, sumD] = kmeans(PPhase_FT_Cxx(scoreMask(:), :), nSpatialComponents, 'Distance', 'correlation', 'Replicates', 128);
-Clusts(scoreMask) = round( memberships );
-Clusts(:, half:end) = Clusts(:, half-2:-1:2);
-Clusts = Clusts(:); 
-
-%Agglomerative hierarchical clustering with the Ward's method and correlation as the similarity metric.
-%UTree = linkage(PPhase_FT_Cxx(scoreMask, :), 'ward', 'correlation');
-%Clusts(scoreMask) = cluster(UTree, 'maxclust', nSpatialComponents);
-
-if ~pasfOpts.boolQuietly,
-	disp('done with the clustering.');
-end
-
-C_omega = PVec_FT_Cxx;
-%TODO: Do we need to store B_omega explicitly?
-B_omega = zeros(nTopEVs, nSpatial, size(PVec_FT_Cxx, 3));
-for i=1:size(PVec_FT_Cxx, 3),
-	B_omega(:, :, i) = PVec_FT_Cxx(:, :, i)';
-end
-
-Z_dynamics = zeros(nTimes, nSpatial, nSpatialComponents);
-for cNum = 1:nSpatialComponents,
-	boolClust = (Clusts == cNum);
-	mask = repmat( reshape(boolClust , nTopEVs, 1, size(PVec_FT_Cxx, 3)), 1, nSpatial, 1);
-
-	X = zeros(NF, nTopEVs);
-	tZ = zeros(size(Z, 1), 1);
-
-	for i=1:size(B_omega,  1),
-		for j=1:size(B_omega, 2),
-			tZ(1:nTimes) = squeeze(Z(:,j));
-			X(:, i) = X(:, i) + squeeze(B_omega(i, j, :).*mask(i, j, :)) .* fft(tZ);
+	if nargin > 2,
+		fields = fieldnames(options);
+		for f=1:length(fields),
+			pasfOpts.(fields{f}) = options.(fields{f});
 		end
 	end
 
-	mask  = permute(mask,[2,1,3]);
-	Z_hat = zeros(NF, nSpatial);
+	if ~pasfOpts.boolQuietly,
+		disp(pasfOpts);
+	end
 
-	for i=1:size(C_omega, 1),
-		for j=1:size(C_omega, 2),
-			Z_hat(:, i) = Z_hat(:, i) + ifft(squeeze(C_omega(i, j, :).*mask(i, j, :)) .* squeeze(X(:, j)) );
+
+	[d1, d2, d3] = size(Z);
+
+	%% masks
+	if nargin < 4,
+		% zero (false) means mask
+		spatialMask = ones(d1, d2);
+	end
+
+
+	%%TODO just for test add the to the function input arguments
+	%frequencies = pasfOpts.SampleTimes;
+	%freqMask = ones(pasfOpts.nTopEVs, length(frequencies));
+	%freqMask(:, frequencies > 10 ) = 0;
+
+	if size(spatialMask, 1) ~= size(Z, 1) || size(spatialMask, 2) ~= size(Z, 2),
+		error('spatialMask size is different from the input spatiotemproal signal.');
+	end	
+	%Z = Z .* repmat( spatialMask, [1, 1, size(Z, 3)] );
+
+	Z = permute(reshape(Z, d1*d2, d3), [2, 1]); %NOTE: Now each column is a time series.
+
+	%%TODO: Add noSpatialMask to avoid the extra computations.
+	Z = Z .* repmat(reshape(spatialMask, [1, d1*d2]), [size(Z, 1), 1]);
+
+	if pasfOpts.boolDemeanInput == 1,
+		Z = detrend(Z, 'constant');
+		if ~pasfOpts.boolQuietly, disp('demeaned the input data.');  end
+	elseif pasfOpts.boolDemeanInput == 2,
+		Z = detrend(Z);
+		if ~pasfOpts.boolQuietly, disp('detrended the input data.'); end
+	end
+
+
+	if ~pasfOpts.boolQuietly,
+		disp('done with the initial steps.');
+	end
+
+
+	%NOTE: Estimate the SDF and compute the top eigenvectors/values of the spectral density matrices.
+	nTimes   = size(Z, 1);
+	nSpatial = size(Z, 2);
+	totalVariation = sum(Z(:).^2);
+	nTopEVs  = pasfOpts.nTopEVs;  
+
+	if ~pasfOpts.boolUseSavedData,
+
+		[PVec_FT_Cxx, PPhase_FT_Cxx, Eigenvalues, NF, Traces] = mvspec(Z, pasfOpts);
+
+		if ~pasfOpts.boolQuietly,
+			disp('done with estimating the spectral density matrices and their eigen decomposition.');
+		end
+
+		if pasfOpts.saveData > 0,
+			filename = strcat(pasfOpts.bfilename, '_intermediate_data.mat');
+			save(filename, 'PVec_FT_Cxx', 'PPhase_FT_Cxx', 'Eigenvalues', 'NF', 'Traces', '-v7.3');
+			disp( strcat('done with saving the intermediate data in "', filename, '".') );
 		end
 	end
-	Z_dynamics(:, :, cNum) = real(Z_hat(1:nTimes, :)); 
-end
 
-if ~pasfOpts.boolQuietly,
-	disp('done with the filtering/separating dynamic components.');
-end
+	if pasfOpts.boolUseSavedData,
+		filename = strcat(pasfOpts.bfilename, '_intermediate_data.mat');
+		load(filename, 'PVec_FT_Cxx', 'PPhase_FT_Cxx', 'Eigenvalues', 'NF', 'Traces');
+		disp( strcat('done with loading the data from "', filename, '".') );
+	end
 
 
-%%preparing the outputs
-Z_dynamics = permute(Z_dynamics, [2,1,4,3]);
-Z_dynamics = reshape(Z_dynamics, d1, d2, d3, nSpatialComponents);
-Z          = reshape(permute(Z, [2, 1]), d1, d2, d3);
-Err        = Z - sum(Z_dynamics, 4);
-Z_dynamics(:, :, :, nSpatialComponents + 1) = Err; 
-Z_dynamics(:, :, :, nSpatialComponents + 2) = Z;
 
-Clusters     = reshape(Clusts, nTopEVs, NF);
-%NOTE: PVec_FT_Cxx \in C^{S x nTopEVs x T};
-Eigenvectors = permute(reshape(abs(PVec_FT_Cxx), d1, d2, nTopEVs, NF), [1, 2, 4, 3]);
+	%NOTE: Decide which eigenvectors we should take into the account bases on their
+	%eigenvalues.
+	sortedEVs   = sort(Eigenvalues(:), 'descend');
 
-if ~pasfOpts.boolQuietly,
-	disp( strcat('Error rate is: ', num2str(sum(Err(:).^2)/sum(Z(:).^2)), '.'));
-end
+	if strcmp( pasfOpts.EigenThresholdMethod, 'MaxGap' ), 
+		diffED = sortedEVs(1:end-1) - sortedEVs(2:end);
+		[maxV, maxIdx] = max( diffED );
+		%%NOTE: to make sure we pick at least nSpatialComponents eigenvectors.
+		maxIdx = max( maxIdx, min(2*nSpatialComponents, length(sortedEVs)-1) );
+		eigenValueThreshold = sortedEVs( maxIdx + 1 );
+		if ~pasfOpts.boolQuietly,
+			fprintf('Max gap between sorted eigenvalues is %d. \n', maxV);
+			fprintf('%d eigenvectors will be used to build the filter. \n', maxIdx);
+		end
+	else
+		indicesMask = ( cumsum(sortedEVs) ./ sum(Traces) ) > (1 - pasfOpts.errorRate);
+		if( sum(indicesMask) > 0 )
+			eigenValueThreshold = max( sortedEVs(indicesMask) );
+		else
+			eigenValueThreshold = 0;
+			warning('set the the eigenvalue threshold to zero.');
+		end
+	end
+
+	if ~pasfOpts.boolQuietly,
+		fprintf('Eigenvalue threshold is %d. \n', eigenValueThreshold);
+	end
+
+	scoreMask = Eigenvalues > eigenValueThreshold;
+
+
+	%NOTE: unwrap the phases to have a smooth phase vector in 2D.
+	if exist('unwrap2D') ~= 3,  mex unwrap2D.c;  end
+
+	PPhase_FT_Cxx = reshape(PPhase_FT_Cxx, nSpatial, nTopEVs * NF )';
+	SM            = boolean( spatialMask(:) );
+
+	%NOTE: When boolParfor is true, it unwraps all the phase vectors but when false it only unwraps
+	%those that are tagged for clustering. The first one is useful when one likes to plot and
+	%investigate the phases in all the frequency but can be very slow.
+	if pasfOpts.boolParfor == 1,
+		%if isempty(gcp('nocreate')),  parpool(maxNumCompThreads);  end
+		parfor i = 1:size(PPhase_FT_Cxx, 1),
+			PPhase_FT_Cxx(i, :) = unwrap2D_phase_vector(PPhase_FT_Cxx(i, :), SM, d1, d2);
+		end
+	else
+		for i = find( scoreMask(:)' ),
+			PPhase_FT_Cxx(i, :) = unwrap2D_phase_vector(PPhase_FT_Cxx(i, :), SM, d1, d2);
+		end
+	end
+
+	if ~pasfOpts.boolQuietly,  disp('done with the phase unwrapping.');  end
+
+	if ~pasfOpts.boolQuietly,
+		fprintf('done with the unwrapping.');
+	end
+
+
+
+	%%NOTE: kmeans/linkage accepts the point cloud as a matrix whose rows are the data point.
+	Clusts = zeros(size(scoreMask)); 
+	half   = 2 + floor(NF/2);
+	scoreMask(:, half:end) = 0;
+
+	if strcmp( pasfOpts.cmethod, 'phase'),
+		datapoints = PPhase_FT_Cxx;
+	elseif strcmp( pasfOpts.cmethod, 'weightedPhase'),
+		datapoints = sqrt(reshape(abs(PVec_FT_Cxx), nSpatial, nTopEVs * NF )') .* PPhase_FT_Cxx;
+	elseif strcmp( pasfOpts.cmethod, 'maskedPhase')
+		datapoints = boolean(reshape(abs(PVec_FT_Cxx), nSpatial, nTopEVs * NF )'>1/sqrt(nSpatial)) .* PPhase_FT_Cxx;
+	elseif strcmp( pasfOpts.cmethod, 'modulus'),
+		datapoints = reshape(abs(PVec_FT_Cxx), nSpatial, nTopEVs * NF )';
+	else
+		error('undefined cmethod!');
+	end
+
+	%freqMask = boolean(freqMask .* scoreMask);
+	freqMask = boolean(scoreMask);
+	[Clusts, ClusterInfo] = robust_cluster(datapoints, ...
+		Eigenvalues, ...
+		PPhase_FT_Cxx, ...
+		reshape(abs(PVec_FT_Cxx), nSpatial, nTopEVs * NF )', ... 
+		freqMask, spatialMask, nSpatialComponents, pasfOpts);
+
+	if mod(NF, 2) == 0, %%NOTE: We ran clustering for the first half of frequencies.
+		Clusts(:, half:end) = Clusts(:, half-2:-1:2);
+	else
+		Clusts(:, half:end) = Clusts(:, half-1:-1:2);
+	end
+	Clusts = Clusts(:); 
+	%normalizing the energy level. We clustered half the spectrum, so should be multiplied by 2.
+	ClusterInfo.CEnergy = 2*ClusterInfo.CEnergy ./ totalVariation;
+
+	if ~pasfOpts.boolQuietly,
+		disp('done with the clustering.');
+	end
+
+
+	%NOTE: Construct the filters and then apply it to the input spatio-temporal signal.
+	C_omega = PVec_FT_Cxx;
+	B_omega = zeros(nTopEVs, nSpatial, size(PVec_FT_Cxx, 3) );
+	for i=1:size(PVec_FT_Cxx, 3),
+		B_omega(:, :, i) = PVec_FT_Cxx(:, :, i)';
+	end
+
+	Components = filter_spatiotemporal_signal(Z, C_omega, B_omega, Clusts, nSpatialComponents);
+
+	if ~pasfOpts.boolQuietly,
+		disp('done with the filtering/separating dynamic components.');
+	end
+
+
+	%%preparing the outputs
+	Components = permute(Components, [2, 1, 4, 3]);
+	Components = reshape(Components, d1, d2, d3, nSpatialComponents);
+	Z          = reshape(permute(Z, [2, 1]), d1, d2, d3);
+	Err        = Z - sum(Components, 4);
+	Components(:, :, :, nSpatialComponents + 1) = Err; 
+	Components(:, :, :, nSpatialComponents + 2) = Z;
+
+	Clusters     = reshape(Clusts, nTopEVs, NF);
+	%NOTE: PVec_FT_Cxx \in C^{S x nTopEVs x T};
+	SDFInfo.Eigenvectors = permute(reshape(abs(PVec_FT_Cxx), d1, d2, nTopEVs, NF), [1, 2, 4, 3]);
+	SDFInfo.Eigenvalues = Eigenvalues;
+	SDFInfo.Traces      = Traces;
+
+	SDFInfo.PhaseArray = zeros(d1, d2, NF, nTopEVs);
+	for j = 1:NF, 
+		for k = 1:nTopEVs,
+			SDFInfo.PhaseArray(:, :, j, k) = reshape(PPhase_FT_Cxx( (j-1)*nTopEVs+k, :), d1, d2);
+		end
+	end
+
+
+	if ~pasfOpts.boolQuietly,
+		disp( strcat('Error rate is: ', num2str(sum(Err(:).^2)/sum(Z(:).^2)), '.') );
+	end
+
+
+	if pasfOpts.saveData > 1,
+		filename = strcat(pasfOpts.bfilename, '_output.mat');
+		save(filename, 'Components', 'Clusters', 'SDFInfo', 'pasfOpts', 'ClusterInfo', '-v7.3');
+
+		if pasfOpts.saveData > 2,
+			Eigenvalues  = SDFInfo.Eigenvalues;
+			Eigenvectors = SDFInfo.Eigenvectors;
+			save(strcat(pasfOpts.bfilename, '_Components.mat'), 'Components',                  '-v7.3');
+			save(strcat(pasfOpts.bfilename, '_Eigenpairs.mat'), 'Eigenvalues', 'Eigenvectors', '-v7.3');
+			save(strcat(pasfOpts.bfilename, '_Clusters.mat'  ), 'Clusters', 'ClusterInfo',     '-v7.3');
+			save(strcat(pasfOpts.bfilename, '_Filters.mat'   ), 'C_omega', 'B_omega',          '-v7.3');
+		end
+	end
+
 
 end %end of pasf
 
 
-%%It estimates the multivariate spectral function.
-function [PVec_FT_Cxx, PPhase_FT_Cxx, Eigenvalues, N, traceSums] = ...
-		mvspec(X, opts)
 
-N0 = size(X,1); 
-N  = N0;
-ncols  = size(X,2);
-xfreq  = 1;
-nTopEVs = opts.nTopEVs;
+function Components = filter_spatiotemporal_signal(Z, C_omega, B_omega, Clusts, nSpatialComponents)
 
-if(opts.detrend == 1 )
-	X = detrend(X);
-else 
-	if( opts.detrend == 2 )
+	[nTopEVs, nSpatial, NF] = size(B_omega);
+	nTimeSamples = size(Z, 1);
+
+	Components = zeros(nTimeSamples, nSpatial, nSpatialComponents);
+
+	for cNum = 1:nSpatialComponents,
+		boolClust = (Clusts == cNum);
+		mask = repmat( reshape(boolClust , nTopEVs, 1, nTimeSamples), 1, nSpatial, 1);
+
+		X = zeros(NF, nTopEVs);
+		tZ = zeros(nTimeSamples, 1);
+
+		for i=1:size(B_omega,  1),
+			for j=1:size(B_omega, 2),
+				tZ(1:nTimeSamples) = squeeze(Z(:, j));
+				X(:, i) = X(:, i) + squeeze(B_omega(i, j, :).*mask(i, j, :)) .* fft(tZ);
+			end
+		end
+
+		mask  = permute(mask, [2, 1, 3]);
+		Z_hat = zeros(NF, nSpatial);
+
+		for i=1:size(C_omega, 1),
+			for j=1:size(C_omega, 2),
+				Z_hat(:, i) = Z_hat(:, i) + ifft(squeeze(C_omega(i, j, :) .* mask(i, j, :)) .* squeeze(X(:, j)) );
+			end
+		end
+		Components(:, :, cNum) = real(Z_hat(1:nTimeSamples, :)); 
+	end
+
+end
+
+
+
+function unwrappedPhaseVec = unwrap2D_phase_vector(phaseVec, mask, d1, d2)
+	phaseVec = reshape(phaseVec, d1, d2);
+	SM = boolean(mask);
+	notSM = double(~SM); %NOTE: The concept of mask changes here cause unwrap2D(.) uses it differently.
+	unwrappedPhaseVec = reshape( unwrap2D( phaseVec, reshape(notSM, d1, d2), 128), 1, d1*d2);
+	%cosmic changes for ploting
+	unwrappedPhaseVec(SM) = unwrappedPhaseVec(SM) - mean( unwrappedPhaseVec(SM) ); 	
+end
+
+
+
+function [Clusts, CI] = robust_cluster(vectors, weights, phase, modulus, ... 
+		mask, spatialMask, nClusters, pasfOpts)
+
+	%TODO merge it with the prev function
+	Clusts  = zeros(size(mask)); 
+	SM      = boolean(spatialMask(:));
+
+	CI.Tree     = linkage(vectors, 'ward', 'corr');
+	Memberships = double(mask(mask));
+	kmeansOpt   = statset('UseParallel', pasfOpts.boolParfor);
+
+	for outlierThreshold = 1:-0.05:min(pasfOpts.outlierThreshold, 1),
+		mask(mask)   = (Memberships > 0); 
+		norm_vectors = normalize_rows( vectors(mask(:), SM) );
+
+		[Memberships, ctrs, ~, cdist] = kmeans( norm_vectors, nClusters, ... 
+			'Options', kmeansOpt, ... 
+			'Distance', 'correlation', 'Replicates', 128);
+		for c = 1:nClusters,
+			outlierMask = (Memberships == c) & (cdist(:, c) > outlierThreshold);
+			Memberships( outlierMask ) = 0; 
+		end
+	end
+	mask(mask)  = (Memberships > 0); 
+	%%NOTE: Memberships only contains labels of unmaksed points.
+	Memberships = Memberships(Memberships>0);
+	norm_vectors = normalize_rows( vectors(mask(:), SM) );
+
+
+	ctmp       = Clusts;
+	ctmp(mask) = Memberships;
+	CEnergy    = zeros(nClusters, 1);
+	for c = 1:nClusters,
+		CEnergy(c) = sum( weights(ctmp == c) );
+	end
+	%%NOTE: Relabel the clusters so that they are sorted based on the energy level.
+	CMap        = rename_cluster_map(Memberships, CEnergy); 
+	Memberships = CMap(Memberships);
+
+	CI.Mem       = round(Memberships);
+	CI.mask      = mask;
+	Clusts(mask) = CI.Mem; 
+
+
+	modulus = modulus(:, SM);
+	phase   = phase  (:, SM);
+
+	ctrs      = zeros(size(ctrs));
+	modctrs   = zeros(size(ctrs));
+	phasectrs = zeros(size(ctrs));
+
+	totalEnergy = sum(weights(:));
+	for c = 1:nClusters,
+
+		vecs = repmat(weights(Clusts == c), 1, size(norm_vectors,2)) .* norm_vectors(Memberships== c, :);
+		ctrs(c, :) = mean( vecs, 1);
+
+		vecs = repmat(weights(Clusts == c), 1, size(modulus, 2)) .* modulus(Clusts == c, :);
+		modctrs(c, :) = mean( vecs, 1);
+
+		vecs = repmat(weights(Clusts == c), 1, size(phase, 2)) .* phase(Clusts == c, :);
+		phasectrs(c, :) = mean( vecs, 1);
+
+		CEnergy(c) = sum( weights(Clusts == c) );
+	end
+
+
+	CI.D                       = cdist;
+	CI.D(:, CMap(1:nClusters)) = cdist(:, 1:nClusters);
+
+	CI.Centers        = zeros( nClusters, length(SM) );
+	CI.Centers(:, SM) = ctrs;
+
+	CI.ModCenters        = zeros( nClusters, length(SM) );
+	CI.ModCenters(:, SM) = modctrs;
+
+	CI.PhaseCenters        = zeros( nClusters, length(SM) );
+	CI.PhaseCenters(:, SM) = phasectrs;
+
+	CI.CSizes         = histc(Memberships, 1:nClusters);
+	CI.CEnergy        = CEnergy;
+
+end
+
+
+
+function mat = normalize_rows( mat )
+	nCols = size(mat, 2);
+	mat = mat -  repmat( mean(mat, 2), 1, nCols ); 
+	mat = mat ./ repmat( sqrt(sum(mat.^2, 2)), 1, nCols );
+end
+
+
+function CMap = rename_cluster_map(mem, weightVec)
+	%% Reindex the cluster names in decreasing order of their sizes.
+	nC      = max(mem);
+	[~,J]   = sort(weightVec, 'descend');
+	J(J)    = 1:nC; %build the map to rename the cluster names. 
+	CMap    = J;
+end
+
+
+%%It estimates the multivariate spectral density function.
+function [PVec_FT_Cxx, PPhase_FT_Cxx, Eigenvalues, N, Traces] =  mvspec(X, opts)
+
+	N0 = size(X,1); 
+	N  = N0;
+	ncols  = size(X,2);
+	xfreq  = 1;
+	nTopEVs = opts.nTopEVs;
+
+	if(opts.detrend == 1 )
 		X = detrend(X, 'constant');
+	elseif( opts.detrend == 2 )
+		X = detrend(X);
 	end
-end
 
-if opts.taperLen > 0,
-	w = taper(N, opt.taperLen)';
-	X = X .* repmat(w, 1, ncols);
-end
-
-
-if opts.boolZeroPad ==  1, 
-	X     = [X; zeros(N-1, ncols)];
-	N     = size(X,1); 
-	ncols = size(X,2);
-end
-
-xfft = fft(X);
-clearvars X; %we don't need it anymore.
-
-if ~opts.boolQuietly,
-	disp('done with xfft computation');
-end
-
-
-spans = 2*floor(opts.spans/2)+1; %%just to make the smoothing easier
-switch opts.kmethod
-	case 'box'
-		g = ones(spans,1);
-	case 'gaussian'
-		g = gausswin(spans);
-	case 'triangle'
-		g = triang(spans);
-	otherwise
-		error('kmethod is undefined [box|gaussian|triangle]');
-end
-g = g/sum(g);
-
-PVec_FT_Cxx   = zeros(ncols, nTopEVs, N); 
-PPhase_FT_Cxx = zeros(ncols, nTopEVs, N); 
-%PScores_Cxx   = zeros(nTopEVs, N);
-Eigenvalues   = zeros(nTopEVs, N);
-empericalThreshold = zeros(N,1);
-
-traceSums = 0;
-half = ceil(spans/2);
-for i=2:floor(N/2)+1, 
-%for i=2:N, 
-	M = zeros(ncols, ncols);
-	%% for 128x128 the following takes 14 sec 
-	%NOTE: estimate the spectral density matirx by smoothing the FFT of empirical autocovariance.
-	%NOTE: since all the coefficients are positive M is positive semi-definite.
-	for j=1:spans, %with the assumption that span is an even number
-		M = M + g(j) * get_periodogram(xfft, N, ncols, N0*xfreq, i, j-half);
+	if opts.taperLen > 0,
+		w = taper(N, opts.taperLen)';
+		X = X .* repmat(w, 1, ncols);
 	end
-	traceSums = traceSums + 2*trace(M);
-	%M = 1/N .* M;
-	%% for 128x128 with nTopEVs=4 the following takes 12 sec 
-	[V, D] = svds(M, nTopEVs, 'L'); 
-	D = diag(D);
 
-	PVec_FT_Cxx(:, :, i) = V; 
-	PVec_FT_Cxx(:, :, N-i+2) = conj(V); 
-	%NOTE: all the eigenvalues must be positive, so trace(M)==\sum_i \lambda_i. TODO: fix the following accordingly.
-	%const = (M(:)'*M(:));
-	%PScores_Cxx(:, i)    = (D.^2)/const; %denominator is eqv to trace(M*M):but faster to compute.
-	Eigenvalues(:, i)    = D; %NOTE: all the eigenvalues must be positive so abs is unnecessary. 
-	Eigenvalues(:, N-i+2)    = D; %NOTE: all the eigenvalues must be positive so abs is unnecessary. 
 
-	%empericalThreshold(i) = median( empericalEValueThreshold(M, 10) );
-	PPhase_FT_Cxx(:, :, i) = angle(V);
-end
+	if opts.boolZeroPad ==  1, 
+		X     = [X; zeros(N-1, ncols)];
+		N     = size(X,1); 
+		ncols = size(X,2);
+	end
+
+	xfft = fft(X);
+	clearvars X; %we don't need it anymore.
+
+	if ~opts.boolQuietly,
+		disp('done with xfft computation.');
+	end
+
+
+	spans = 2*floor(opts.spans/2)+1; %%just to make the smoothing easier
+	switch opts.kmethod,
+		case 'box'
+			g = ones(spans,1);
+		case 'gaussian'
+			%NOTE: e.g. gausswin(7)=[0.0439, 0.2494, 0.7066, 1.00, 0.7066, 0.2494, 0.0439]'
+			g = gausswin(spans);  
+		case 'triangle'
+			%NOTE: e.g.   triang(7)=[0.25, 0.50, 0.75, 1.00, 0.75, 0.5, 0.25]' 
+			g = triang(spans);   
+		otherwise
+			error('kmethod is undefined [box|gaussian|triangle]');
+	end
+	g = g/sum(g);
+
+	PVec_FT_Cxx   = zeros(ncols, nTopEVs, N); 
+	PPhase_FT_Cxx = zeros(ncols, nTopEVs, N); 
+	Eigenvalues   = zeros(nTopEVs, N);
+	Traces        = zeros(N, 1);
+
+	half = ceil(spans/2);
+	nFreq = floor(N/2)+1;
+	for i=2:nFreq,   %NOTE: Estimate the spectral density function by smoothing the periodogram.
+
+		M = zeros(ncols, ncols);
+
+		%NOTE: Since all the coefficients, g_j,  are positive M is positive semi-definite.
+		for j=1:spans, %with the assumption that span is an even number
+			M = M + g(j) * get_periodogram(xfft, N, ncols, N0*xfreq, i, j-half);
+		end
+		Traces(i)     = trace(M);
+		Traces(N-i+2) = Traces(i);
+
+		[V, D] = svds(M, nTopEVs, 'L'); 
+		D      = diag(D);
+
+		PVec_FT_Cxx(:, :, i)     = V; 
+		PVec_FT_Cxx(:, :, N-i+2) = conj(V); 
+
+		Eigenvalues(:, i)      = D;  
+		Eigenvalues(:, N-i+2)  = D;  
+
+		PPhase_FT_Cxx(:, :, i)     = angle(V);
+		PPhase_FT_Cxx(:, :, N-i+2) = angle(V); %%TODO I guess it should be -angle(V)!?
+
+		if (~opts.boolQuietly) && (floor((i-1)*25/nFreq) < floor(i*25/nFreq)),
+			fprintf('%d%c ', floor(i*100/nFreq), '%');
+			if i == nFreq, fprintf('\n'); end
+		end
+
+	end
 
 end 
 
 
-%TODO: change the name of the following function
 function pgram = get_periodogram(xfft, N, ncols, const, i, offset)
 	idx = i + offset;
 	if( idx < 2 ) %ignoring zero freq;
+		%%TODO
 		idx = N + idx - 1; %-1 to ignore zero freq 
+		%idx = 1-(idx - 1); %-1 to ignore zero freq 
 	end
 	if( idx > N )
 		idx = idx - N;
@@ -374,20 +641,3 @@ function w = taper(n, p)
 	w = [w, ones(1, n - 2*m), flip(w)];
 end
 
-
-%NOTE: This function tries to form a random matrix out of M entries 
-% to find a threshold for eigenvalues of the original matrix with a structure.
-function topEValue = empericalEValueThreshold(M, nIterations)
-
-	N = size(M,1);
-
-	%TODO subtract the mean of each row from the M and after resampling 
-	%add it back. Check the lit to see if someone has developed and studied the bootstrap procedure
-	topEValue = zeros(nIterations, 1);
-	for i=1:nIterations,
-		Mp = reshape(datasample(M(:), N*N), N, N);
-		Mp = triu(Mp) + triu(Mp, +1)';
-		topEValue(i) = abs(eigs(Mp, 1));
-	end
-
-end
