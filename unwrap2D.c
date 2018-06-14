@@ -739,10 +739,10 @@ void mexFunction(int nlhs, mxArray* plhs[], int nrhs, const mxArray* prhs[])
 	int rows = mxGetM(prhs[0]);		
 	int cols = mxGetN(prhs[0]);
 	const int image_size = cols * rows;
-	int maxNIter = 10; /* the default value */
-	if( nrhs > 2 ){
-		maxNIter = mxGetScalar( prhs[2] );
-	}
+	int maxNIter = 1; /* the default value */
+	//if( nrhs > 2 ){
+	//	maxNIter = mxGetScalar( prhs[2] );
+	//}
 
 	/*Get pointer to input data*/
 	double* wrapped = mxGetPr(prhs[0]);

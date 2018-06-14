@@ -124,8 +124,6 @@ function [Components, Clusters, ClusterInfo, SDFInfo] = pasf(Z, nSpatialComponen
 		nSpatialComponents = 1;
 	end
 
-	%%TODO separate pasf options from mvspec options
-	%% setting up the default values
 	pasfOpts = struct('nTopEVs', nSpatialComponents, ...
 		'EigenThresholdMethod', 'ErrRate', ...
 		'Normalize', 0, ...
@@ -136,7 +134,9 @@ function [Components, Clusters, ClusterInfo, SDFInfo] = pasf(Z, nSpatialComponen
 		'boolDemeanInput', 1, 'kmeansReplicates', 128, 'outlierThreshold', 2, ...
 		'detrend', 2, 'boolZeroPad', 0, 'saveData', 1, 'boolUseSavedData', 0, ...
 		'boolParfor', 1, ...
-		'boolQuietly', 0, 'bfilename', 'pasf_out');
+		'boolQuietly', 0, ...
+		'interfilename', 'pasf_intermediate_data.mat', ...
+		'bfilename', 'pasf');
 
 
 	if nargin > 2,
@@ -145,10 +145,15 @@ function [Components, Clusters, ClusterInfo, SDFInfo] = pasf(Z, nSpatialComponen
 			pasfOpts.(fields{f}) = options.(fields{f});
 		end
 	end
+	%FIXME
+	pasfOpts.interfilename = strcat(pasfOpts.bfilename, '_intermediate_data.mat');
 
 	if ~pasfOpts.boolQuietly,
 		disp(pasfOpts);
 	end
+	PASF_INPUT_OPTIONS = evalc('disp(pasfOpts)');
+	fid = fopen( strcat(pasfOpts.bfilename, '_pasf_input_options.txt'), 'wt' );
+	fprintf(fid, '%s', PASF_INPUT_OPTIONS); fclose(fid);
 
 
 	[d1, d2, d3] = size(Z);
@@ -200,7 +205,7 @@ function [Components, Clusters, ClusterInfo, SDFInfo] = pasf(Z, nSpatialComponen
 		[PVec_FT_Cxx, PPhase_FT_Cxx, Eigenvalues, NF, Traces] = mvspec(Z, pasfOpts);
 
 		if ~pasfOpts.boolQuietly,
-			disp('done with estimating the spectral density matrices and their eigen decomposition.');
+			disp('done with estimating the spectral density matrices and their eigendecomposition.');
 		end
 
 		if pasfOpts.saveData > 0,
@@ -211,7 +216,8 @@ function [Components, Clusters, ClusterInfo, SDFInfo] = pasf(Z, nSpatialComponen
 	end
 
 	if pasfOpts.boolUseSavedData,
-		filename = strcat(pasfOpts.bfilename, '_intermediate_data.mat');
+		filename = pasfOpts.interfilename;
+		%filename = strcat(pasfOpts.bfilename, '_intermediate_data.mat');
 		load(filename, 'PVec_FT_Cxx', 'PPhase_FT_Cxx', 'Eigenvalues', 'NF', 'Traces');
 		disp( strcat('done with loading the data from "', filename, '".') );
 	end
@@ -416,7 +422,8 @@ function unwrappedPhaseVec = unwrap2D_phase_vector(phaseVec, mask, d1, d2)
 	phaseVec = reshape(phaseVec, d1, d2);
 	SM = boolean(mask);
 	notSM = double(~SM); %NOTE: The concept of mask changes here cause unwrap2D(.) uses it differently.
-	unwrappedPhaseVec = reshape( unwrap2D( phaseVec, reshape(notSM, d1, d2), 128), 1, d1*d2);
+	%unwrappedPhaseVec = reshape( unwrap2D( phaseVec, reshape(notSM, d1, d2), 128), 1, d1*d2);
+	unwrappedPhaseVec = reshape( unwrap2D( phaseVec, reshape(notSM, d1, d2), 1), 1, d1*d2);
 	%cosmic changes for ploting
 	unwrappedPhaseVec(SM) = unwrappedPhaseVec(SM) - mean( unwrappedPhaseVec(SM) ); 	
 end
@@ -440,7 +447,7 @@ function [Clusts, CI] = robust_cluster(vectors, weights, phase, modulus, ...
 
 		[Memberships, ctrs, ~, cdist] = kmeans( norm_vectors, nClusters, ... 
 			'Options', kmeansOpt, ... 
-			'Distance', 'correlation', 'Replicates', 128);
+			'Distance', 'correlation', 'Replicates', pasfOpts.kmeansReplicates);
 		for c = 1:nClusters,
 			outlierMask = (Memberships == c) & (cdist(:, c) > outlierThreshold);
 			Memberships( outlierMask ) = 0; 
@@ -480,10 +487,12 @@ function [Clusts, CI] = robust_cluster(vectors, weights, phase, modulus, ...
 		vecs = repmat(weights(Clusts == c), 1, size(norm_vectors,2)) .* norm_vectors(Memberships== c, :);
 		ctrs(c, :) = mean( vecs, 1);
 
-		vecs = repmat(weights(Clusts == c), 1, size(modulus, 2)) .* modulus(Clusts == c, :);
+		%vecs = repmat(weights(Clusts == c), 1, size(modulus, 2)) .* modulus(Clusts == c, :);
+		vecs =  modulus(Clusts == c, :);
 		modctrs(c, :) = mean( vecs, 1);
 
-		vecs = repmat(weights(Clusts == c), 1, size(phase, 2)) .* phase(Clusts == c, :);
+		%vecs = repmat(weights(Clusts == c), 1, size(phase, 2)) .* phase(Clusts == c, :);
+		vecs =  phase(Clusts == c, :);
 		phasectrs(c, :) = mean( vecs, 1);
 
 		CEnergy(c) = sum( weights(Clusts == c) );
@@ -502,7 +511,7 @@ function [Clusts, CI] = robust_cluster(vectors, weights, phase, modulus, ...
 	CI.PhaseCenters        = zeros( nClusters, length(SM) );
 	CI.PhaseCenters(:, SM) = phasectrs;
 
-	CI.CSizes         = histc(Memberships, 1:nClusters);
+	%CI.CSizes         = histc(Memberships, 1:nClusters);
 	CI.CEnergy        = CEnergy;
 
 end
